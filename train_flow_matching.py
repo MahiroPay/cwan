@@ -179,12 +179,14 @@ class FlowMatchingTrainer:
         """
         # Sample noise x_0 ~ N(0, I)
         x_0 = torch.randn_like(x_1)
+        x_0 = x_0.bfloat16()
         
         # Reshape t for broadcasting: [B] -> [B, 1, 1, 1, 1]
         t_broadcast = t.view(-1, 1, 1, 1, 1)
         
         # Linear interpolation: x_t = (1-t)*x_0 + t*x_1
         x_t = (1 - t_broadcast) * x_0 + t_broadcast * x_1
+        x_t = x_t.bfloat16()
         
         return x_t, x_0
     
@@ -224,8 +226,9 @@ class FlowMatchingTrainer:
         # Model prediction
         # Note: Wan2.2 model expects timestep in [0, 1000] range typically
         # For flow matching, we scale t from [0, 1] to model's expected range
+        t = t.bfloat16()
         timestep_scaled = t * 1000.0
-        
+        context = context.bfloat16()
         predicted_velocity = self.model(
             x=x_t,
             timestep=timestep_scaled,
@@ -399,8 +402,9 @@ class FlowMatchingTrainer:
             'global_step': self.global_step,
             'epoch': self.epoch,
         }
-        safe_torch.save_file(checkpoint, path)
-        # torch.save(checkpoint, path)
+        # safe_torch.save_file(checkpoint['model_state_dict'], path + "statedict.safetensors")
+        # safe_torch.save_file(checkpoint['optimizer_state_dict'], path + "optimizer.safetensors")
+        torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
     
     def load_checkpoint(self, path: str):
@@ -466,14 +470,15 @@ def main():
         in_dim=48,  # Wan2.2 uses 48-channel latents
         out_dim=48,
         dim=3072,
-        ffn_dim=8192,
+        ffn_dim=14336,
         num_heads=16,
         num_layers=num_blocks_in_checkpoint,  # Use the actual number from checkpoint
         text_len=512,
         text_dim=4096,
     )
-    safe_torch.load_model(model, "models/wan2.2.safetensors", device="cuda")
-    model.to("cuda").train()
+    mod = safe_torch.load_file("models/wan2.2_ti2v_5B_fp16.safetensors", device="cpu")
+    model.load_state_dict(mod)
+    model.bfloat16().to("cuda").train()
     print('model loaded')
     # Initialize trainer
     trainer = FlowMatchingTrainer(
@@ -504,17 +509,17 @@ def main():
     )
     print('dataloader and scheduler set up')
     # Training loop
-    num_epochs = 5
+    num_epochs = 100
     for epoch in range(num_epochs):
         metrics = trainer.train_epoch(dataloader, scheduler)
         print(f"Epoch {epoch+1}/{num_epochs} - Loss: {metrics['loss']:.4f}, Cos Sim: {metrics['velocity_cos_sim']:.3f}")
         
         # Save checkpoint every N epochs
-        if (epoch + 1) % 10 == 0:
-            trainer.save_checkpoint(f"checkpoints/wan22_flow_epoch_{epoch+1}.safetensors")
+        # if (epoch + 1) % 10 == 0:
+            # trainer.save_checkpoint(f"checkpoints/{epoch+1}")
     
     # Save final model
-    trainer.save_checkpoint("checkpoints/wan22_flow_final.safetensors")
+    trainer.save_checkpoint("checkpoints/MoeMoe.pt")
     logger.info("Training complete!")
 
 

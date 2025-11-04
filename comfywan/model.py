@@ -140,8 +140,8 @@ class WanAttentionBlock(nn.Module):
         
         # Normalization layers
         self.norm1 = operations.LayerNorm(dim, eps, elementwise_affine=False)
-        self.norm3 = operations.LayerNorm(dim, eps, elementwise_affine=False)
         self.norm2 = operations.LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm3 = operations.LayerNorm(dim, eps, elementwise_affine=True) 
         
         # Feed-forward network
         self.ffn = nn.Sequential(
@@ -350,7 +350,7 @@ class WanModel(torch.nn.Module):
             Denoised video tensors [B, C_out, F, H, W]
         """
         # Patch embedding
-        x = self.patch_embedding(x.float()).to(x.dtype)
+        x = self.patch_embedding(x.to(self.patch_embedding.weight.dtype)).to(x.dtype)
         grid_sizes = x.shape[2:]
         x = x.flatten(2).transpose(1, 2)
 
@@ -363,6 +363,7 @@ class WanModel(torch.nn.Module):
 
         # Text embeddings
         context = self.text_embedding(context)
+        
 
         # Apply transformer blocks
         for i, block in enumerate(self.blocks):

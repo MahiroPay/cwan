@@ -10,6 +10,7 @@ import safetensors.torch as safe_torch
 from comfywan import WanVAE
 
 EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.png', '.jpg', '.jpeg', '.webp', '.webm']
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,13 @@ def _image_to_tensor(image_path: Path) -> torch.Tensor:
     return tensor
 
 
-def precalculate_latents(dataset_path: Path, vae: WanVAE, device: torch.device, overwrite: bool = False):
+def precalculate_latents(
+    dataset_path: Path,
+    vae: WanVAE,
+    device: torch.device,
+    overwrite: bool = False,
+    decode_test: bool = False,
+):
     image_paths = [p for p in dataset_path.rglob('*') if p.suffix.lower() in EXTENSIONS]
     if not image_paths:
         logger.warning("No images or videos found for latent precalculation")
@@ -64,8 +71,19 @@ def precalculate_latents(dataset_path: Path, vae: WanVAE, device: torch.device, 
             continue
         with torch.no_grad():
             latent = vae.encode(tensor)
-        safe_torch.save_file({'latent': latent.squeeze(0).cpu()}, str(latent_path))
+        latent_cpu = latent.squeeze(0).cpu()
+        safe_torch.save_file({'latent': latent_cpu}, str(latent_path))
         logger.info("Saved latent for %s", path)
+
+        if decode_test and path.suffix.lower() in IMAGE_EXTENSIONS:
+            decoded = vae.decode(latent)
+            decoded = decoded.squeeze(0).squeeze(1)
+            decoded = torch.clamp(decoded, -1.0, 1.0)
+            decoded_img = ((decoded.permute(1, 2, 0) + 1.0) * 127.5)
+            decoded_img = decoded_img.detach().numpy().astype(np.uint8)
+            decoded_path = path.with_name(f"{path.stem}.decoded{path.suffix}")
+            Image.fromarray(decoded_img).save(decoded_path)
+            logger.info("Saved decode test image to %s", decoded_path)
 
 
 def parse_args():
@@ -79,6 +97,7 @@ def parse_args():
     )
     parser.add_argument("--device", default="cuda", help="Device to run VAE encoding on")
     parser.add_argument("--overwrite", action="store_true", help="Recompute latents even if they exist")
+    parser.add_argument("--decode-test", action="store_true", help="Decode latents and save reconstructions for inspection")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
@@ -96,7 +115,7 @@ def main():
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
     vae = _load_vae(args.vae_checkpoint, device)
-    precalculate_latents(dataset_path, vae, device, overwrite=args.overwrite)
+    precalculate_latents(dataset_path, vae, device, overwrite=args.overwrite, decode_test=args.decode_test)
 
 
 if __name__ == "__main__":
