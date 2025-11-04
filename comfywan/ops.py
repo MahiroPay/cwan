@@ -19,6 +19,7 @@ class Conv2d(nn.Conv2d):
     pass
 
 
+# class Linear(RTLinear):
 class Linear(nn.Linear):
     """Standard Linear"""
     pass

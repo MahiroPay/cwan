@@ -305,7 +305,15 @@ def detect_te_model(sd):
     if "model.layers.0.post_attention_layernorm.weight" in sd:
         return TEModel.LLAMA3_8
     return None
-
+def t5_xxl_detect(state_dict, prefix=""):
+    out = {}
+    t5_key = "{}encoder.final_layer_norm.weight".format(prefix)
+    if t5_key in state_dict:
+        out["dtype_t5"] = state_dict[t5_key].dtype
+    scaled_fp8_key = "{}scaled_fp8".format(prefix)
+    if scaled_fp8_key in state_dict:
+        out["t5xxl_scaled_fp8"] = state_dict[scaled_fp8_key].dtype
+    return out
 
 def t5xxl_detect(clip_data):
     weight_name = "encoder.block.23.layer.1.DenseReluDense.wi_1.weight"
@@ -313,7 +321,7 @@ def t5xxl_detect(clip_data):
 
     for sd in clip_data:
         if weight_name in sd or weight_name_old in sd:
-            return comfy.text_encoders.sd3_clip.t5_xxl_detect(sd)
+            return t5_xxl_detect(sd)
 
     return {}
 
@@ -326,6 +334,33 @@ def llama_detect(clip_data):
 
     return {}
 
+
+def model_options_long_clip(sd, tokenizer_data, model_options):
+    w = sd.get("clip_l.text_model.embeddings.position_embedding.weight", None)
+    if w is None:
+        w = sd.get("clip_g.text_model.embeddings.position_embedding.weight", None)
+    else:
+        model_name = "clip_g"
+
+    if w is None:
+        w = sd.get("text_model.embeddings.position_embedding.weight", None)
+        if w is not None:
+            if "text_model.encoder.layers.30.mlp.fc1.weight" in sd:
+                model_name = "clip_g"
+            elif "text_model.encoder.layers.1.mlp.fc1.weight" in sd:
+                model_name = "clip_l"
+    else:
+        model_name = "clip_l"
+
+    if w is not None:
+        tokenizer_data = tokenizer_data.copy()
+        model_options = model_options.copy()
+        model_config = model_options.get("model_config", {})
+        model_config["max_position_embeddings"] = w.shape[0]
+        model_options["{}_model_config".format(model_name)] = model_config
+        tokenizer_data["{}_max_length".format(model_name)] = w.shape[0]
+    return tokenizer_data, model_options
+    
 def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}):
     clip_data = state_dicts
 
@@ -353,7 +388,7 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
     parameters = 0
     for c in clip_data:
         parameters += comfy.utils.calculate_parameters(c)
-        tokenizer_data, model_options = comfy.text_encoders.long_clipl.model_options_long_clip(c, tokenizer_data, model_options)
+        tokenizer_data, model_options = model_options_long_clip(c, tokenizer_data, model_options)
 
     clip = CLIP(clip_target, embedding_directory=embedding_directory, parameters=parameters, tokenizer_data=tokenizer_data, model_options=model_options)
     for c in clip_data:

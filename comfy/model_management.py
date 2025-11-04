@@ -307,7 +307,7 @@ if is_nvidia():
     MIN_WEIGHT_MEMORY_RATIO = 0.0
 
 ENABLE_PYTORCH_ATTENTION = False
-if False:
+if True:
     ENABLE_PYTORCH_ATTENTION = True
     XFORMERS_IS_AVAILABLE = False
 
@@ -796,15 +796,10 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
     return torch.float32
 
 def text_encoder_offload_device():
-    if args.gpu_only:
-        return get_torch_device()
-    else:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
 def text_encoder_device():
-    if args.gpu_only:
-        return get_torch_device()
-    elif vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.NORMAL_VRAM:
+    if vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.NORMAL_VRAM:
         if should_use_fp16(prioritize_performance=False):
             return get_torch_device()
         else:
@@ -1020,7 +1015,7 @@ def sage_attention_enabled():
     return False
 
 def flash_attention_enabled():
-    return True
+    return False
 
 def xformers_enabled():
     global directml_enabled

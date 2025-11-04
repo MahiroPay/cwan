@@ -16,7 +16,6 @@ Reference:
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
@@ -26,7 +25,6 @@ import numpy as np
 from typing import Optional, Dict, Any, Tuple
 import logging
 from tqdm import tqdm
-from PIL import Image
 import os
 import safetensors.torch as safe_torch
 from comfywan import WanModel, WanVAE, Wan22LatentFormat
@@ -422,64 +420,42 @@ class FlowMatchingTrainer:
 EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.png', '.jpg', '.jpeg', '.webp', '.webm']
 
 class FolderDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_path: str = "./dataset/", vae: Optional[WanVAE] = None):
+    def __init__(self, dataset_path: str = "./dataset/"):
         super().__init__()
-        if vae is None:
-            raise ValueError("VAE must be provided for encoding videos.")
         self.dataset_path = Path(dataset_path)
-        self.img_paths = [
-            p for p in self.dataset_path.rglob('*') 
-            if p.suffix.lower() in EXTENSIONS
-        ]
-        self.precalculated_latents = {}
-        for path in self.img_paths:
-            # b, c, f, h, w
-            # f is frames, leave as 1 for images
-            image = Image.open(path).convert('RGB')
-            image = np.array(image).astype(np.float32) / 127.5 - 1.0
-            #rescale so res is mod 8
-            h, w, _ = image.shape
-            new_h = (h // 16) * 16
-            new_w = (w // 16) * 16
-            image = image[:new_h, :new_w, :]
-            image_tensor = torch.from_numpy(image)
-            image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
-            #frames
-            image_tensor = image_tensor.unsqueeze(2)  # [1, C, 1, H, W]
-            image_tensor = image_tensor.to("cuda")
-            latent = vae.encode(image_tensor)
-            self.precalculated_latents[str(path)] = latent.squeeze(0)
-        
+        if not self.dataset_path.exists():
+            raise FileNotFoundError(f"Dataset path {self.dataset_path} does not exist")
+
         self.combinations = []
-        for img_path in self.img_paths:
+        for img_path in self.dataset_path.rglob('*'):
+            if img_path.suffix.lower() not in EXTENSIONS:
+                continue
             emb_path = img_path.with_suffix('.safetensors')
-            if emb_path.exists():
-                self.combinations.append((self.precalculated_latents.get(str(img_path)), emb_path))
-            
+            latent_path = img_path.with_suffix('.latent.safetensors')
+            if emb_path.exists() and latent_path.exists():
+                self.combinations.append((latent_path, emb_path))
+
+        if not self.combinations:
+            raise ValueError(
+                "No latent/embedding pairs found. Run precalculate_image_embeds.py before training."
+            )
+        
     def __len__(self):
         return len(self.combinations)
     
     def __getitem__(self, idx):
-        latent, emb_path = self.combinations[idx]
-        embedding = safe_torch.load_file(emb_path)['embeddings']
-        return (latent, embedding)
+        latent_path, emb_path = self.combinations[idx]
+        latent = safe_torch.load_file(str(latent_path))['latent'].float()
+        embedding = safe_torch.load_file(str(emb_path))['embeddings'].float()
+        return latent, embedding
         
         
 def main():
     """
     Example training script
     """
-    # Initialize VAE for encoding in dataset
-    vae = WanVAE(
-        z_dim=48, dim_mult = [1, 2, 4, 4], num_res_blocks = 2, attn_scales = [], temperal_downsample = [False, True, True], dropout = 0.0
-    )
-    vae.load_state_dict(safe_torch.load_file("models/vae/vae2.2.safetensors"))
-    vae.to("cuda").eval()
-    dataset = FolderDataset(dataset_path="./dataset/", vae=vae)
-    # deload vae since not useful
-    del vae
-    torch.cuda.empty_cache()
-    print('setup done')
+    dataset = FolderDataset(dataset_path="./dataset/")
+    print('dataset ready')
     # Initialize model components
     # Load checkpoint to check number of layers    
     # Count the number of blocks in the checkpoint
@@ -501,8 +477,8 @@ def main():
     print('model loaded')
     # Initialize trainer
     trainer = FlowMatchingTrainer(
-        model=model,
-        vae=vae,
+    model=model,
+    vae=None,
         learning_rate=1e-4,
         weight_decay=0.01,
         grad_clip=1.0,
@@ -535,10 +511,10 @@ def main():
         
         # Save checkpoint every N epochs
         if (epoch + 1) % 10 == 0:
-            trainer.save_checkpoint(f"checkpoints/wan22_flow_epoch_{epoch+1}.pt")
+            trainer.save_checkpoint(f"checkpoints/wan22_flow_epoch_{epoch+1}.safetensors")
     
     # Save final model
-    trainer.save_checkpoint("checkpoints/wan22_flow_final.pt")
+    trainer.save_checkpoint("checkpoints/wan22_flow_final.safetensors")
     logger.info("Training complete!")
 
 
