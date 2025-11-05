@@ -18,6 +18,7 @@ Reference:
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
@@ -28,10 +29,54 @@ from tqdm import tqdm
 import os
 import safetensors.torch as safe_torch
 from comfywan import WanModel, WanVAE, Wan22LatentFormat
+import torch.distributed as dist
+import argparse
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def setup_distributed():
+    """
+    Initialize distributed training environment.
+    
+    Returns:
+        Tuple of (rank, world_size, local_rank)
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        # SLURM environment
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = rank % torch.cuda.device_count()
+    else:
+        # Single GPU or CPU
+        rank = 0
+        world_size = 1
+        local_rank = 0
+    
+    if world_size > 1:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://')
+        # Ensure all processes are synchronized
+        dist.barrier()
+    
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """Clean up distributed training environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int = 0) -> bool:
+    """Check if current process is the main process."""
+    return rank == 0
 
 
 class FlowMatchingTrainer:
@@ -57,6 +102,8 @@ class FlowMatchingTrainer:
         ema_decay = 0.9999,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         """
         Initialize the flow matching trainer
@@ -72,13 +119,28 @@ class FlowMatchingTrainer:
             ema_decay: Exponential moving average decay for model weights
             device: Device to train on
             dtype: Training dtype (bfloat16 recommended for A100/H100)
+            rank: Process rank for distributed training
+            world_size: Total number of processes for distributed training
         """
         self.device = device
         self.dtype = dtype
         self.grad_clip = grad_clip
+        self.rank = rank
+        self.world_size = world_size
+        self.is_distributed = world_size > 1
         
         # Model components
         self.model = model.to(device)
+        
+        # Wrap model with DDP for multi-GPU training
+        if self.is_distributed:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.rank],
+                output_device=self.rank,
+                find_unused_parameters=False,
+            )
+        
         self.vae = vae.to(device) if vae is not None else None
         self.latent_format = latent_format if latent_format is not None else Wan22LatentFormat()
         
@@ -88,9 +150,10 @@ class FlowMatchingTrainer:
             for param in self.vae.parameters():
                 param.requires_grad = False
                 
-        # Optimizer
+        # Optimizer - get the actual model parameters (unwrap DDP if needed)
+        model_params = self.model.module.parameters() if self.is_distributed else self.model.parameters()
         self.optimizer = AdamW(
-            self.model.parameters(),
+            model_params,
             lr=learning_rate,
             betas=betas,
             weight_decay=weight_decay,
@@ -108,11 +171,13 @@ class FlowMatchingTrainer:
         
     def _create_ema_model(self):
         """Create EMA version of the model"""
-        ema_model = type(self.model)(
-            **{k: v for k, v in self.model.__dict__.items() 
+        # Get the actual model (unwrap DDP if needed)
+        actual_model = self.model.module if self.is_distributed else self.model
+        ema_model = type(actual_model)(
+            **{k: v for k, v in actual_model.__dict__.items() 
                if not k.startswith('_') and k not in ['training']}
         ).to(self.device)
-        ema_model.load_state_dict(self.model.state_dict())
+        ema_model.load_state_dict(actual_model.state_dict())
         ema_model.eval()
         for param in ema_model.parameters():
             param.requires_grad = False
@@ -121,9 +186,11 @@ class FlowMatchingTrainer:
     @torch.no_grad()
     def update_ema(self):
         """Update EMA model parameters"""
+        # Get the actual model parameters (unwrap DDP if needed)
+        actual_model = self.model.module if self.is_distributed else self.model
         for ema_param, model_param in zip(
             self.ema_model.parameters(), 
-            self.model.parameters()
+            actual_model.parameters()
         ):
             ema_param.data.mul_(self.ema_decay).add_(
                 model_param.data, alpha=1 - self.ema_decay
@@ -271,7 +338,9 @@ class FlowMatchingTrainer:
         Returns:
             Dictionary of metrics
         """
-        self.model.train()
+        # Get the actual model for train mode (unwrap DDP if needed)
+        actual_model = self.model.module if self.is_distributed else self.model
+        actual_model.train()
         
         # Move to device and dtype
         
@@ -298,8 +367,9 @@ class FlowMatchingTrainer:
         loss.backward()
         
         # Gradient clipping
+        model_params = actual_model.parameters()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), 
+            model_params, 
             self.grad_clip
         )
         
@@ -343,11 +413,15 @@ class FlowMatchingTrainer:
         self.epoch += 1
         epoch_metrics = {}
         
-        progress_bar = tqdm(
-            dataloader, 
-            desc=f"Epoch {self.epoch}",
-            dynamic_ncols=True
-        )
+        # Only show progress bar on main process
+        if is_main_process(self.rank):
+            progress_bar = tqdm(
+                dataloader, 
+                desc=f"Epoch {self.epoch}",
+                dynamic_ncols=True
+            )
+        else:
+            progress_bar = dataloader
         
         for batch_idx, batch in enumerate(progress_bar):
             # Unpack batch (handle different formats)
@@ -366,12 +440,13 @@ class FlowMatchingTrainer:
                     epoch_metrics[key] = []
                 epoch_metrics[key].append(value)
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f"{metrics['loss']:.4f}",
-                'grad': f"{metrics['grad_norm']:.2f}",
-                'cos_sim': f"{metrics['velocity_cos_sim']:.3f}",
-            })
+            # Update progress bar (only on main process)
+            if is_main_process(self.rank) and hasattr(progress_bar, 'set_postfix'):
+                progress_bar.set_postfix({
+                    'loss': f"{metrics['loss']:.4f}",
+                    'grad': f"{metrics['grad_norm']:.2f}",
+                    'cos_sim': f"{metrics['velocity_cos_sim']:.3f}",
+                })
             
             # Step scheduler if per-step scheduling
             if scheduler is not None and hasattr(scheduler, 'step_update'):
@@ -386,17 +461,26 @@ class FlowMatchingTrainer:
         if scheduler is not None and not hasattr(scheduler, 'step_update'):
             scheduler.step()
         
-        logger.info(f"Epoch {self.epoch} - Loss: {avg_metrics['loss']:.4f}, "
-                   f"Cos Sim: {avg_metrics['velocity_cos_sim']:.3f}")
+        # Log only on main process
+        if is_main_process(self.rank):
+            logger.info(f"Epoch {self.epoch} - Loss: {avg_metrics['loss']:.4f}, "
+                       f"Cos Sim: {avg_metrics['velocity_cos_sim']:.3f}")
         
         return avg_metrics
     
     def save_checkpoint(self, path: str):
-        """Save training checkpoint"""
+        """Save training checkpoint (only on main process)"""
+        # Only save on main process
+        if not is_main_process(self.rank):
+            return
+            
         os.makedirs(os.path.dirname(path), exist_ok=True)
         
+        # Get actual model state dict (unwrap DDP if needed)
+        actual_model = self.model.module if self.is_distributed else self.model
+        
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': actual_model.state_dict(),
             'ema_model_state_dict': self.ema_model.state_dict() if self.ema_model is not None else None,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'global_step': self.global_step,
@@ -411,15 +495,19 @@ class FlowMatchingTrainer:
         """Load training checkpoint"""
         checkpoint = torch.load(path, map_location=self.device)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Get actual model (unwrap DDP if needed)
+        actual_model = self.model.module if self.is_distributed else self.model
+        actual_model.load_state_dict(checkpoint['model_state_dict'])
+        
         if self.ema_model is not None and checkpoint['ema_model_state_dict'] is not None:
             self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
         self.epoch = checkpoint['epoch']
         
-        logger.info(f"Loaded checkpoint from {path}")
-        logger.info(f"Resumed at epoch {self.epoch}, step {self.global_step}")
+        if is_main_process(self.rank):
+            logger.info(f"Loaded checkpoint from {path}")
+            logger.info(f"Resumed at epoch {self.epoch}, step {self.global_step}")
 
 EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.png', '.jpg', '.jpeg', '.webp', '.webm']
 
@@ -454,12 +542,52 @@ class FolderDataset(torch.utils.data.Dataset):
         return latent, embedding
         
         
+def parse_args():
+    """Parse command-line arguments"""
+    parser = argparse.ArgumentParser(description='Train Wan2.2 with Flow Matching')
+    parser.add_argument('--dataset_path', type=str, default='./dataset/',
+                        help='Path to dataset directory')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Batch size per GPU')
+    parser.add_argument('--num_epochs', type=int, default=100,
+                        help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                        help='Learning rate')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of data loading workers')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory to save checkpoints')
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Local rank for distributed training (usually auto-set)')
+    return parser.parse_args()
+
+
 def main():
     """
-    Example training script
+    Training script with multi-GPU support
     """
-    dataset = FolderDataset(dataset_path="./dataset/")
-    print('dataset ready')
+    # Parse arguments
+    args = parse_args()
+    
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    
+    # Set device
+    if world_size > 1:
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Log info only on main process
+    if is_main_process(rank):
+        logger.info(f"Starting training with {world_size} GPU(s)")
+        logger.info(f"Rank: {rank}, Local Rank: {local_rank}, World Size: {world_size}")
+    
+    # Load dataset
+    dataset = FolderDataset(dataset_path=args.dataset_path)
+    if is_main_process(rank):
+        print(f'Dataset ready with {len(dataset)} samples')
+    
     # Initialize model components
     # Load checkpoint to check number of layers    
     # Count the number of blocks in the checkpoint
@@ -476,53 +604,94 @@ def main():
         text_len=512,
         text_dim=4096,
     )
+    
+    # Load pretrained weights on CPU first, then move to device
+    if is_main_process(rank):
+        print('Loading model weights...')
     mod = safe_torch.load_file("models/wan2.2_ti2v_5B_fp16.safetensors", device="cpu")
     model.load_state_dict(mod)
-    model.bfloat16().to("cuda").train()
-    print('model loaded')
-    # Initialize trainer
+    
+    # Move model to device and set dtype
+    model = model.to(device).bfloat16()
+    
+    if is_main_process(rank):
+        print('Model loaded')
+    
+    # Initialize trainer with distributed settings
     trainer = FlowMatchingTrainer(
-    model=model,
-    vae=None,
-        learning_rate=1e-4,
+        model=model,
+        vae=None,
+        learning_rate=args.learning_rate,
         weight_decay=0.01,
         grad_clip=1.0,
         ema_decay=None,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
+        rank=rank,
+        world_size=world_size,
     )
-    print('trainer initialized')
+    if is_main_process(rank):
+        print('Trainer initialized')
+    
+    # Setup dataloader with DistributedSampler for multi-GPU
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
     
     dataloader = DataLoader(
         dataset,
-        batch_size=1,  # Adjust based on GPU memory
-        shuffle=True,
-        num_workers=4,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
     
     # Learning rate scheduler
     scheduler = CosineAnnealingLR(
         trainer.optimizer,
-        T_max=5,  # Number of epochs
+        T_max=args.num_epochs,
         eta_min=1e-6,
     )
-    print('dataloader and scheduler set up')
-    # Training loop
-    num_epochs = 100
-    for epoch in range(num_epochs):
-        metrics = trainer.train_epoch(dataloader, scheduler)
-        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {metrics['loss']:.4f}, Cos Sim: {metrics['velocity_cos_sim']:.3f}")
-        
-        # Save checkpoint every N epochs
-        # if (epoch + 1) % 10 == 0:
-            # trainer.save_checkpoint(f"checkpoints/{epoch+1}")
+    if is_main_process(rank):
+        print('Dataloader and scheduler set up')
     
-    # Save final model
-    trainer.save_checkpoint("checkpoints/MoeMoe.pt")
-    logger.info("Training complete!")
+    # Training loop
+    for epoch in range(args.num_epochs):
+        # Set epoch for DistributedSampler (ensures different shuffling each epoch)
+        if world_size > 1:
+            sampler.set_epoch(epoch)
+        
+        metrics = trainer.train_epoch(dataloader, scheduler)
+        
+        # Log only on main process
+        if is_main_process(rank):
+            print(f"Epoch {epoch+1}/{args.num_epochs} - Loss: {metrics['loss']:.4f}, "
+                  f"Cos Sim: {metrics['velocity_cos_sim']:.3f}")
+        
+        # Save checkpoint every N epochs (only on main process)
+        # if (epoch + 1) % 10 == 0:
+        #     trainer.save_checkpoint(f"{args.checkpoint_dir}/epoch_{epoch+1}.pt")
+    
+    # Save final model (only on main process)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    trainer.save_checkpoint(f"{args.checkpoint_dir}/MoeMoe.pt")
+    
+    if is_main_process(rank):
+        logger.info("Training complete!")
+    
+    # Cleanup distributed training
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
-    
     main()
