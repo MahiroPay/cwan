@@ -6,9 +6,9 @@ Flow matching learns a vector field that transports noise to data through optima
 
 Key concepts:
 - Flow matching uses conditional probability paths from noise (t=0) to data (t=1)
-- The model learns to predict the velocity field v_t(x_t | x_1)
-- Training objective: E[||v_theta(x_t, t, c) - (x_1 - x_0)||^2]
-- Simple linear interpolation: x_t = (1-t)*x_0 + t*x_1 where x_0~N(0,I), x_1~data
+- The model predicts the residual r = x_0 - x_1 that recovers the clean latent via x_t - sigma * r
+- Training objective: E[||x_t - sigma * f_theta(x_t, sigma, c) - x_1||^2]
+- Rectified-flow interpolation: x_sigma = sigma * x_0 + (1 - sigma) * x_1 where x_0~N(0,I), x_1~data
 
 Reference:
 - "Flow Matching for Generative Modeling" (Lipman et al., 2023)
@@ -18,7 +18,6 @@ Reference:
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
@@ -29,54 +28,10 @@ from tqdm import tqdm
 import os
 import safetensors.torch as safe_torch
 from comfywan import WanModel, WanVAE, Wan22LatentFormat
-import torch.distributed as dist
-import argparse
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def setup_distributed():
-    """
-    Initialize distributed training environment.
-    
-    Returns:
-        Tuple of (rank, world_size, local_rank)
-    """
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-    elif 'SLURM_PROCID' in os.environ:
-        # SLURM environment
-        rank = int(os.environ['SLURM_PROCID'])
-        world_size = int(os.environ['SLURM_NTASKS'])
-        local_rank = rank % torch.cuda.device_count()
-    else:
-        # Single GPU or CPU
-        rank = 0
-        world_size = 1
-        local_rank = 0
-    
-    if world_size > 1:
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')
-        # Ensure all processes are synchronized
-        dist.barrier()
-    
-    return rank, world_size, local_rank
-
-
-def cleanup_distributed():
-    """Clean up distributed training environment."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def is_main_process(rank: int = 0) -> bool:
-    """Check if current process is the main process."""
-    return rank == 0
 
 
 class FlowMatchingTrainer:
@@ -86,8 +41,8 @@ class FlowMatchingTrainer:
     Implements rectified flow / flow matching training where:
     - x_0 ~ N(0, I) is pure noise
     - x_1 is the real data (latent)
-    - x_t = (1-t)*x_0 + t*x_1 for t in [0, 1]
-    - Model predicts v_t = x_1 - x_0 (the velocity/direction)
+    - x_sigma = sigma * x_0 + (1 - sigma) * x_1 for sigma in (0, 1)
+    - Model predicts residual r = x_0 - x_1 so that x_1 = x_sigma - sigma * r
     """
     
     def __init__(
@@ -102,8 +57,9 @@ class FlowMatchingTrainer:
         ema_decay = 0.9999,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
-        rank: int = 0,
-        world_size: int = 1,
+        sigma_shift: float = 8.0,
+        sigma_multiplier: float = 1000.0,
+        sigma_eps: float = 1e-4,
     ):
         """
         Initialize the flow matching trainer
@@ -119,28 +75,19 @@ class FlowMatchingTrainer:
             ema_decay: Exponential moving average decay for model weights
             device: Device to train on
             dtype: Training dtype (bfloat16 recommended for A100/H100)
-            rank: Process rank for distributed training
-            world_size: Total number of processes for distributed training
+            sigma_shift: Flow schedule shift, matches ComfyUI's ModelSamplingDiscreteFlow
+            sigma_multiplier: Scaling used when converting sigma to timesteps for Wan22
+            sigma_eps: Small constant to avoid degenerate sigma values at the bounds
         """
         self.device = device
         self.dtype = dtype
         self.grad_clip = grad_clip
-        self.rank = rank
-        self.world_size = world_size
-        self.is_distributed = world_size > 1
+        self.sigma_shift = sigma_shift
+        self.sigma_multiplier = sigma_multiplier
+        self.sigma_eps = sigma_eps
         
         # Model components
         self.model = model.to(device)
-        
-        # Wrap model with DDP for multi-GPU training
-        if self.is_distributed:
-            self.model = torch.nn.parallel.DistributedDataParallel(
-                self.model,
-                device_ids=[self.rank],
-                output_device=self.rank,
-                find_unused_parameters=False,
-            )
-        
         self.vae = vae.to(device) if vae is not None else None
         self.latent_format = latent_format if latent_format is not None else Wan22LatentFormat()
         
@@ -150,10 +97,9 @@ class FlowMatchingTrainer:
             for param in self.vae.parameters():
                 param.requires_grad = False
                 
-        # Optimizer - get the actual model parameters (unwrap DDP if needed)
-        model_params = self.model.module.parameters() if self.is_distributed else self.model.parameters()
+        # Optimizer
         self.optimizer = AdamW(
-            model_params,
+            self.model.parameters(),
             lr=learning_rate,
             betas=betas,
             weight_decay=weight_decay,
@@ -171,13 +117,11 @@ class FlowMatchingTrainer:
         
     def _create_ema_model(self):
         """Create EMA version of the model"""
-        # Get the actual model (unwrap DDP if needed)
-        actual_model = self.model.module if self.is_distributed else self.model
-        ema_model = type(actual_model)(
-            **{k: v for k, v in actual_model.__dict__.items() 
+        ema_model = type(self.model)(
+            **{k: v for k, v in self.model.__dict__.items() 
                if not k.startswith('_') and k not in ['training']}
         ).to(self.device)
-        ema_model.load_state_dict(actual_model.state_dict())
+        ema_model.load_state_dict(self.model.state_dict())
         ema_model.eval()
         for param in ema_model.parameters():
             param.requires_grad = False
@@ -186,11 +130,9 @@ class FlowMatchingTrainer:
     @torch.no_grad()
     def update_ema(self):
         """Update EMA model parameters"""
-        # Get the actual model parameters (unwrap DDP if needed)
-        actual_model = self.model.module if self.is_distributed else self.model
         for ema_param, model_param in zip(
             self.ema_model.parameters(), 
-            actual_model.parameters()
+            self.model.parameters()
         ):
             ema_param.data.mul_(self.ema_decay).add_(
                 model_param.data, alpha=1 - self.ema_decay
@@ -211,34 +153,36 @@ class FlowMatchingTrainer:
             latent = self.latent_format.process_in(latent)
         return latent
     
-    def sample_timesteps(self, batch_size: int) -> torch.Tensor:
+    def sample_sigmas(self, batch_size: int) -> torch.Tensor:
         """
-        Sample random timesteps for flow matching
-        
+        Sample noise levels (sigma) following ComfyUI's rectified-flow schedule.
+
         Args:
-            batch_size: Number of timesteps to sample
-            
+            batch_size: Number of sigma values to sample.
+
         Returns:
-            Timesteps in [0, 1]
+            Tensor of shape [batch_size] with sigma in (0, 1).
         """
-        # Uniform sampling in [0, 1]
-        # Note: Some implementations use logit-normal sampling for better coverage
-        return torch.rand(batch_size, device=self.device)
+        u = torch.rand(batch_size, device=self.device, dtype=torch.float32)
+        u = u.clamp_(self.sigma_eps, 1.0 - self.sigma_eps)
+        sigma = self.sigma_shift * u / (1.0 + (self.sigma_shift - 1.0) * u)
+        return sigma
     
     def get_noisy_latent(
-        self, 
-        x_1: torch.Tensor, 
-        t: torch.Tensor
+        self,
+        x_1: torch.Tensor,
+        sigma: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Create noisy latent via linear interpolation
         
-        Flow matching interpolant: x_t = (1-t)*x_0 + t*x_1
-        where x_0 ~ N(0, I) is pure noise and x_1 is the data
+        Rectified-flow interpolant used by ComfyUI:
+        x_sigma = sigma * x_0 + (1 - sigma) * x_1
+        where x_0 ~ N(0, I) is pure noise and x_1 is the data latent.
         
         Args:
             x_1: Clean data latent [B, C, T, H, W]
-            t: Timesteps [B] in [0, 1]
+            sigma: Noise levels [B] in (0, 1)
             
         Returns:
             x_t: Interpolated latent [B, C, T, H, W]
@@ -246,81 +190,76 @@ class FlowMatchingTrainer:
         """
         # Sample noise x_0 ~ N(0, I)
         x_0 = torch.randn_like(x_1)
-        x_0 = x_0.bfloat16()
         
-        # Reshape t for broadcasting: [B] -> [B, 1, 1, 1, 1]
-        t_broadcast = t.view(-1, 1, 1, 1, 1)
+        # Reshape sigma for broadcasting: [B] -> [B, 1, 1, 1, 1]
+        sigma_broadcast = sigma.view(-1, 1, 1, 1, 1).to(x_1.dtype)
         
-        # Linear interpolation: x_t = (1-t)*x_0 + t*x_1
-        x_t = (1 - t_broadcast) * x_0 + t_broadcast * x_1
-        x_t = x_t.bfloat16()
+        # Rectified-flow interpolation consistent with ComfyUI
+        x_t = sigma_broadcast * x_0 + (1 - sigma_broadcast) * x_1
         
         return x_t, x_0
     
     def compute_flow_matching_loss(
         self,
         x_1: torch.Tensor,
-        t: torch.Tensor,
+        sigma: torch.Tensor,
         context: torch.Tensor,
         x_t: Optional[torch.Tensor] = None,
         x_0: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute flow matching loss
-        
-        The model predicts the velocity v_t = dx/dt
-        Target velocity: v_t = d/dt[(1-t)*x_0 + t*x_1] = x_1 - x_0
-        
-        Loss: E[||v_theta(x_t, t, c) - (x_1 - x_0)||^2]
-        
+        Compute the rectified-flow loss aligned with ComfyUI's implementation.
+
+        The Wan2.2 flow backbone is trained so that
+            x_0 = x_sigma - sigma * f_theta(x_sigma, sigma, c)
+        matches the clean latent. This is equivalent to predicting the
+        residual (noise - data) under the rectified-flow interpolant.
+
         Args:
             x_1: Clean data latent [B, C, T, H, W]
-            t: Timesteps [B] in [0, 1]
+            sigma: Noise levels [B] in (0, 1)
             context: Text conditioning [B, L, D]
-            x_t: Pre-computed noisy latent (optional)
-            x_0: Pre-computed noise (optional)
-            
+            x_t: Optional precomputed noisy latent
+            x_0: Optional precomputed noise sample
+
         Returns:
-            Dictionary with loss and metrics
+            Dictionary with loss scalar and diagnostic metrics.
         """
-        # Get noisy latent if not provided
+        sigma = sigma.to(self.device, dtype=torch.float32)
+
         if x_t is None or x_0 is None:
-            x_t, x_0 = self.get_noisy_latent(x_1, t)
-        
-        # Target velocity: v = x_1 - x_0
-        target_velocity = x_1 - x_0
-        
-        # Model prediction
-        # Note: Wan2.2 model expects timestep in [0, 1000] range typically
-        # For flow matching, we scale t from [0, 1] to model's expected range
-        t = t.bfloat16()
-        timestep_scaled = t * 1000.0
-        context = context.bfloat16()
-        predicted_velocity = self.model(
+            x_t, x_0 = self.get_noisy_latent(x_1, sigma)
+
+        sigma_broadcast = sigma.view(-1, 1, 1, 1, 1).to(x_t.dtype)
+        timestep_scaled = sigma * self.sigma_multiplier
+
+        predicted_residual = self.model(
             x=x_t,
             timestep=timestep_scaled,
             context=context,
         )
-        
-        # MSE loss between predicted and target velocity
-        loss = F.mse_loss(predicted_velocity, target_velocity, reduction='mean')
-        
-        # Additional metrics
+        predicted_residual = predicted_residual.to(x_t.dtype)
+
+        x0_pred = x_t - sigma_broadcast * predicted_residual
+        loss = F.mse_loss(x0_pred.float(), x_1.float(), reduction='mean')
+
         with torch.no_grad():
-            # Velocity magnitude
-            pred_mag = predicted_velocity.abs().mean()
-            target_mag = target_velocity.abs().mean()
-            
-            # Cosine similarity (direction alignment)
-            pred_flat = predicted_velocity.flatten(1)
-            target_flat = target_velocity.flatten(1)
+            target_residual = (x_0 - x_1).float()
+            pred_flat = predicted_residual.float().flatten(1)
+            target_flat = target_residual.flatten(1)
             cos_sim = F.cosine_similarity(pred_flat, target_flat, dim=1).mean()
-        
+            residual_mse = F.mse_loss(pred_flat, target_flat, reduction='mean')
+            pred_mag = pred_flat.abs().mean()
+            target_mag = target_flat.abs().mean()
+            sigma_mean = sigma.mean()
+
         return {
             'loss': loss,
-            'pred_velocity_mag': pred_mag,
-            'target_velocity_mag': target_mag,
-            'velocity_cos_sim': cos_sim,
+            'residual_mse': residual_mse,
+            'pred_residual_mag': pred_mag,
+            'target_residual_mag': target_mag,
+            'residual_cos_sim': cos_sim,
+            'sigma_mean': sigma_mean,
         }
     
     def train_step(
@@ -333,33 +272,36 @@ class FlowMatchingTrainer:
         
         Args:
             videos: Batch of videos [B, C, T, H, W] or pre-encoded latents
-            texts: List of text prompts
+            texts: Batched text embeddings [B, L, D] or list of per-sample tensors
             
         Returns:
             Dictionary of metrics
         """
-        # Get the actual model for train mode (unwrap DDP if needed)
-        actual_model = self.model.module if self.is_distributed else self.model
-        actual_model.train()
+        self.model.train()
         
         # Move to device and dtype
-        
-        videos = videos.to(self.device, dtype=self.dtype)
-        
-        # Encode to latent space if needed
-        if self.vae is not None and videos.shape[1] != 48:
-            x_1 = self.encode_video(videos)
+        videos = videos.to(self.device)
+
+        # Encode to latent space if needed and normalize latents
+        if self.vae is not None and videos.shape[1] != self.latent_format.latent_channels:
+            x_1 = self.encode_video(videos.to(dtype=torch.float32))
         else:
-            x_1 = videos
-        
-        context = texts.to(self.device, dtype=self.dtype)
-        
-        # Sample timesteps
+            x_1 = self.latent_format.process_in(videos.to(dtype=self.dtype))
+
+        x_1 = x_1.to(self.device, dtype=self.dtype)
+
+        if isinstance(texts, (list, tuple)):
+            context = torch.stack(texts, dim=0)
+        else:
+            context = texts
+        context = context.to(self.device, dtype=self.dtype)
+
+        # Sample noise levels
         batch_size = x_1.shape[0]
-        t = self.sample_timesteps(batch_size)
+        sigma = self.sample_sigmas(batch_size)
         
         # Compute loss
-        loss_dict = self.compute_flow_matching_loss(x_1, t, context)
+        loss_dict = self.compute_flow_matching_loss(x_1, sigma, context)
         loss = loss_dict['loss']
         
         # Backward pass
@@ -367,9 +309,8 @@ class FlowMatchingTrainer:
         loss.backward()
         
         # Gradient clipping
-        model_params = actual_model.parameters()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model_params, 
+            self.model.parameters(), 
             self.grad_clip
         )
         
@@ -387,9 +328,11 @@ class FlowMatchingTrainer:
         metrics = {
             'loss': loss.item(),
             'grad_norm': grad_norm.item(),
-            'pred_velocity_mag': loss_dict['pred_velocity_mag'].item(),
-            'target_velocity_mag': loss_dict['target_velocity_mag'].item(),
-            'velocity_cos_sim': loss_dict['velocity_cos_sim'].item(),
+            'residual_mse': loss_dict['residual_mse'].item(),
+            'pred_residual_mag': loss_dict['pred_residual_mag'].item(),
+            'target_residual_mag': loss_dict['target_residual_mag'].item(),
+            'residual_cos_sim': loss_dict['residual_cos_sim'].item(),
+            'sigma_mean': loss_dict['sigma_mean'].item(),
             'learning_rate': self.optimizer.param_groups[0]['lr'],
         }
         
@@ -413,15 +356,11 @@ class FlowMatchingTrainer:
         self.epoch += 1
         epoch_metrics = {}
         
-        # Only show progress bar on main process
-        if is_main_process(self.rank):
-            progress_bar = tqdm(
-                dataloader, 
-                desc=f"Epoch {self.epoch}",
-                dynamic_ncols=True
-            )
-        else:
-            progress_bar = dataloader
+        progress_bar = tqdm(
+            dataloader, 
+            desc=f"Epoch {self.epoch}",
+            dynamic_ncols=True
+        )
         
         for batch_idx, batch in enumerate(progress_bar):
             # Unpack batch (handle different formats)
@@ -440,13 +379,13 @@ class FlowMatchingTrainer:
                     epoch_metrics[key] = []
                 epoch_metrics[key].append(value)
             
-            # Update progress bar (only on main process)
-            if is_main_process(self.rank) and hasattr(progress_bar, 'set_postfix'):
-                progress_bar.set_postfix({
-                    'loss': f"{metrics['loss']:.4f}",
-                    'grad': f"{metrics['grad_norm']:.2f}",
-                    'cos_sim': f"{metrics['velocity_cos_sim']:.3f}",
-                })
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f"{metrics['loss']:.4f}",
+                'grad': f"{metrics['grad_norm']:.2f}",
+                'cos_sim': f"{metrics['residual_cos_sim']:.3f}",
+                'sigma': f"{metrics['sigma_mean']:.3f}",
+            })
             
             # Step scheduler if per-step scheduling
             if scheduler is not None and hasattr(scheduler, 'step_update'):
@@ -461,53 +400,41 @@ class FlowMatchingTrainer:
         if scheduler is not None and not hasattr(scheduler, 'step_update'):
             scheduler.step()
         
-        # Log only on main process
-        if is_main_process(self.rank):
-            logger.info(f"Epoch {self.epoch} - Loss: {avg_metrics['loss']:.4f}, "
-                       f"Cos Sim: {avg_metrics['velocity_cos_sim']:.3f}")
+        logger.info(
+            f"Epoch {self.epoch} - Loss: {avg_metrics['loss']:.4f}, "
+            f"Cos Sim: {avg_metrics['residual_cos_sim']:.3f}"
+        )
         
         return avg_metrics
     
     def save_checkpoint(self, path: str):
-        """Save training checkpoint (only on main process)"""
-        # Only save on main process
-        if not is_main_process(self.rank):
-            return
-            
+        """Save training checkpoint"""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         
-        # Get actual model state dict (unwrap DDP if needed)
-        actual_model = self.model.module if self.is_distributed else self.model
-        
         checkpoint = {
-            'model_state_dict': actual_model.state_dict(),
+            'model_state_dict': self.model.state_dict(),
             'ema_model_state_dict': self.ema_model.state_dict() if self.ema_model is not None else None,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'global_step': self.global_step,
             'epoch': self.epoch,
         }
-        # safe_torch.save_file(checkpoint['model_state_dict'], path + "statedict.safetensors")
-        # safe_torch.save_file(checkpoint['optimizer_state_dict'], path + "optimizer.safetensors")
-        torch.save(checkpoint, path)
+        safe_torch.save_file(checkpoint, path)
+        # torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
     
     def load_checkpoint(self, path: str):
         """Load training checkpoint"""
         checkpoint = torch.load(path, map_location=self.device)
         
-        # Get actual model (unwrap DDP if needed)
-        actual_model = self.model.module if self.is_distributed else self.model
-        actual_model.load_state_dict(checkpoint['model_state_dict'])
-        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
         if self.ema_model is not None and checkpoint['ema_model_state_dict'] is not None:
             self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
         self.epoch = checkpoint['epoch']
         
-        if is_main_process(self.rank):
-            logger.info(f"Loaded checkpoint from {path}")
-            logger.info(f"Resumed at epoch {self.epoch}, step {self.global_step}")
+        logger.info(f"Loaded checkpoint from {path}")
+        logger.info(f"Resumed at epoch {self.epoch}, step {self.global_step}")
 
 EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.png', '.jpg', '.jpeg', '.webp', '.webm']
 
@@ -541,7 +468,7 @@ class FolderDataset(torch.utils.data.Dataset):
         embedding = safe_torch.load_file(str(emb_path))['embeddings'].float()
         return latent, embedding
         
-        
+import argparse 
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(description='Train Wan2.2 with Flow Matching')
@@ -569,24 +496,11 @@ def main():
     # Parse arguments
     args = parse_args()
     
-    # Setup distributed training
-    rank, world_size, local_rank = setup_distributed()
     
-    # Set device
-    if world_size > 1:
-        device = f"cuda:{local_rank}"
-    else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Log info only on main process
-    if is_main_process(rank):
-        logger.info(f"Starting training with {world_size} GPU(s)")
-        logger.info(f"Rank: {rank}, Local Rank: {local_rank}, World Size: {world_size}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Load dataset
     dataset = FolderDataset(dataset_path=args.dataset_path)
-    if is_main_process(rank):
-        print(f'Dataset ready with {len(dataset)} samples')
     
     # Initialize model components
     # Load checkpoint to check number of layers    
@@ -606,46 +520,27 @@ def main():
     )
     
     # Load pretrained weights on CPU first, then move to device
-    if is_main_process(rank):
-        print('Loading model weights...')
     mod = safe_torch.load_file("models/wan2.2_ti2v_5B_fp16.safetensors", device="cpu")
     model.load_state_dict(mod)
     
     # Move model to device and set dtype
     model = model.to(device).bfloat16()
     
-    if is_main_process(rank):
-        print('Model loaded')
     
     # Initialize trainer with distributed settings
     trainer = FlowMatchingTrainer(
         model=model,
         vae=None,
-        learning_rate=args.learning_rate,
+        learning_rate=1e-4,
         weight_decay=0.01,
         grad_clip=1.0,
         ema_decay=None,
-        device=device,
-        dtype=torch.bfloat16,
-        rank=rank,
-        world_size=world_size,
+        device="cuda",
+        dtype=torch.bfloat16
     )
-    if is_main_process(rank):
-        print('Trainer initialized')
     
-    # Setup dataloader with DistributedSampler for multi-GPU
-    if world_size > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=True,
-        )
-        shuffle = False
-    else:
-        sampler = None
-        shuffle = True
+    sampler = None
+    shuffle = True
     
     dataloader = DataLoader(
         dataset,
@@ -662,36 +557,25 @@ def main():
         T_max=args.num_epochs,
         eta_min=1e-6,
     )
-    if is_main_process(rank):
-        print('Dataloader and scheduler set up')
-    
+    print('dataloader and scheduler set up')
     # Training loop
-    for epoch in range(args.num_epochs):
-        # Set epoch for DistributedSampler (ensures different shuffling each epoch)
-        if world_size > 1:
-            sampler.set_epoch(epoch)
-        
+    num_epochs = 5
+    for epoch in range(num_epochs):
         metrics = trainer.train_epoch(dataloader, scheduler)
+        print(
+            f"Epoch {epoch+1}/{num_epochs} - Loss: {metrics['loss']:.4f}, "
+            f"Cos Sim: {metrics['residual_cos_sim']:.3f}"
+        )
         
-        # Log only on main process
-        if is_main_process(rank):
-            print(f"Epoch {epoch+1}/{args.num_epochs} - Loss: {metrics['loss']:.4f}, "
-                  f"Cos Sim: {metrics['velocity_cos_sim']:.3f}")
-        
-        # Save checkpoint every N epochs (only on main process)
-        # if (epoch + 1) % 10 == 0:
-        #     trainer.save_checkpoint(f"{args.checkpoint_dir}/epoch_{epoch+1}.pt")
+        # Save checkpoint every N epochs
+        if (epoch + 1) % 10 == 0:
+            trainer.save_checkpoint(f"checkpoints/wan22_flow_epoch_{epoch+1}.pt")
     
-    # Save final model (only on main process)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    trainer.save_checkpoint(f"{args.checkpoint_dir}/MoeMoe.pt")
-    
-    if is_main_process(rank):
-        logger.info("Training complete!")
-    
-    # Cleanup distributed training
-    cleanup_distributed()
+    # Save final model
+    trainer.save_checkpoint("checkpoints/wan22_flow_final.pt")
+    logger.info("Training complete!")
 
 
 if __name__ == "__main__":
+    
     main()
