@@ -80,7 +80,7 @@ def main() -> None:
         with torch.inference_mode():
             for idx, target in enumerate(targets):
                 toks = clip.tokenize(batch_texts[idx])
-                embeddings = clip.encode_from_tokens_scheduled(toks)
+                embed = clip.encode_from_tokens_scheduled(toks)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 save_file(
                     {
