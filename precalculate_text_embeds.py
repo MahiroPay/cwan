@@ -78,17 +78,17 @@ def main() -> None:
             continue
 
         with torch.inference_mode():
-            toks = [clip.tokenize(text) for text in batch_texts]
-            embeddings = [clip.encode_from_tokens_scheduled(tok) for tok in toks]
-        for idx, target in enumerate(targets):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            save_file(
-                {
-                    "embeddings": embeddings[idx][0][0].cpu().contiguous(),
-                },
-                str(target),
-            )
-            print(f"Saved {target}")
+            for idx, target in enumerate(targets):
+                toks = clip.tokenize(batch_texts[idx])
+                embeddings = clip.encode_from_tokens_scheduled(toks)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                save_file(
+                    {
+                        "embeddings": embed[0][0].cpu().contiguous(),
+                    },
+                    str(target),
+                )
+                print(f"Saved {target}")
 
     print("Done.")
 
