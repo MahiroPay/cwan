@@ -86,20 +86,21 @@ def predict_x0(
     sigma_multiplier: float,
 ) -> torch.Tensor:
     """Return CFG-combined x0 prediction for a single sigma."""
-    batch = latent.shape[0]
-    sigma_tensor = torch.full((batch,), sigma_value, device=latent.device, dtype=torch.float32)
-    timestep = sigma_tensor * sigma_multiplier
+    with torch.no_grad():  # ✅ Add this!
+        batch = latent.shape[0]
+        sigma_tensor = torch.full((batch,), sigma_value, device=latent.device, dtype=torch.float32)
+        timestep = sigma_tensor * sigma_multiplier
 
-    cond_in = cond.expand(batch, -1, -1).to(latent.dtype)
-    uncond_in = uncond.expand(batch, -1, -1).to(latent.dtype)
+        cond_in = cond.expand(batch, -1, -1).to(latent.dtype)
+        uncond_in = uncond.expand(batch, -1, -1).to(latent.dtype)
 
-    pred_cond = model(x=latent, timestep=timestep, context=cond_in)
-    pred_uncond = model(x=latent, timestep=timestep, context=uncond_in)
+        pred_cond = model(x=latent, timestep=timestep, context=cond_in)
+        pred_uncond = model(x=latent, timestep=timestep, context=uncond_in)
 
-    residual = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
-    sigma_broadcast = sigma_tensor.view(batch, 1, 1, 1, 1).to(latent.dtype)
-    x0 = latent - sigma_broadcast * residual
-    return x0
+        residual = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+        sigma_broadcast = sigma_tensor.view(batch, 1, 1, 1, 1).to(latent.dtype)
+        x0 = latent - sigma_broadcast * residual
+        return x0
 
 
 def rectified_flow_sample(
@@ -116,23 +117,29 @@ def rectified_flow_sample(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    torch.manual_seed(seed)
-    latent = torch.randn(latent_shape, device=device, dtype=dtype)
-    sigmas = torch.linspace(sigma_start, sigma_end, steps + 1, device=device, dtype=torch.float32)
-    for i in range(steps):
-        print(i)
-        print(torch.cuda.memory_summary())
-        sigma_curr = float(sigmas[i].item())
-        sigma_next = float(sigmas[i + 1].item())
-        if sigma_curr <= 0.0:
-            break
-        x0 = predict_x0(model, latent, sigma_curr, cond, uncond, cfg_scale, sigma_multiplier)
-        if sigma_next <= 0.0:
-            latent = x0
-            break
-        ratio = torch.tensor(sigma_next / sigma_curr, device=device, dtype=latent.dtype)
-        latent = ratio * latent + (1.0 - ratio) * x0
-    return latent
+    with torch.no_grad():  # ✅ Add outer context too!
+        torch.manual_seed(seed)
+        latent = torch.randn(latent_shape, device=device, dtype=dtype)
+        sigmas = torch.linspace(sigma_start, sigma_end, steps + 1, device=device, dtype=torch.float32)
+        
+        for i in range(steps):
+            print(i)
+            sigma_curr = float(sigmas[i].item())
+            sigma_next = float(sigmas[i + 1].item())
+            if sigma_curr <= 0.0:
+                break
+            x0 = predict_x0(model, latent, sigma_curr, cond, uncond, cfg_scale, sigma_multiplier)
+            if sigma_next <= 0.0:
+                latent = x0
+                break
+            ratio = sigma_next / sigma_curr  # ✅ Use Python float directly
+            latent = ratio * latent + (1.0 - ratio) * x0
+            
+            # ✅ Optional: Force garbage collection every N steps
+            if i % 5 == 0:
+                torch.cuda.empty_cache()
+        
+        return latent
 
 
 def save_preview(
