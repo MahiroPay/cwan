@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 from typing import Optional
-
+import torch.profiler
 import safetensors.torch as safe_torch
 import torch
 from PIL import Image
@@ -109,8 +109,9 @@ def rectified_flow_sample(
     torch.manual_seed(seed)
     latent = torch.randn(latent_shape, device=device, dtype=dtype)
     sigmas = torch.linspace(sigma_start, sigma_end, steps + 1, device=device, dtype=torch.float32)
-
     for i in range(steps):
+        print(i)
+        print(torch.cuda.memory_summary())
         sigma_curr = float(sigmas[i].item())
         sigma_next = float(sigmas[i + 1].item())
         if sigma_curr <= 0.0:
