@@ -10,6 +10,10 @@ Key concepts:
 - Training objective: E[||x_t - sigma * f_theta(x_t, sigma, c) - x_1||^2]
 - Rectified-flow interpolation: x_sigma = sigma * x_0 + (1 - sigma) * x_1 where x_0~N(0,I), x_1~data
 
+Memory Optimizations:
+- Use --gradient_checkpointing to reduce memory usage by ~50-70% (slower by ~30-40%)
+- See MEMORY_OPTIMIZATIONS.md for detailed documentation
+
 Reference:
 - "Flow Matching for Generative Modeling" (Lipman et al., 2023)
 - "Stable Video Diffusion" uses rectified flow
@@ -486,6 +490,10 @@ def parse_args():
                         help='Directory to save checkpoints')
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='Local rank for distributed training (usually auto-set)')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                        help='Enable gradient checkpointing for memory-efficient training')
+    parser.add_argument('--vae_gradient_checkpointing', action='store_true',
+                        help='Enable gradient checkpointing for VAE (if used)')
     return parser.parse_args()
 
 
@@ -517,6 +525,7 @@ def main():
         num_layers=num_blocks_in_checkpoint,  # Use the actual number from checkpoint
         text_len=512,
         text_dim=4096,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     
     # Load pretrained weights on CPU first, then move to device
@@ -525,6 +534,10 @@ def main():
     
     # Move model to device and set dtype
     model = model.to(device).bfloat16()
+    
+    # Log memory optimization settings
+    if args.gradient_checkpointing:
+        logger.info("Gradient checkpointing enabled for main model")
     
     
     # Initialize trainer with distributed settings

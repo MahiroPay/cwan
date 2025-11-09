@@ -698,6 +698,7 @@ class WanVAE(nn.Module):
         attn_scales=[],
         temperal_downsample=[True, True, False],
         dropout=0.0,
+        gradient_checkpointing=False,
     ):
         super().__init__()
         self.dim = dim
@@ -707,6 +708,7 @@ class WanVAE(nn.Module):
         self.attn_scales = attn_scales
         self.temperal_downsample = temperal_downsample
         self.temperal_upsample = temperal_downsample[::-1]
+        self.gradient_checkpointing = gradient_checkpointing
 
         # modules
         self.encoder = Encoder3d(
@@ -730,6 +732,18 @@ class WanVAE(nn.Module):
             dropout,
         )
 
+    def _checkpoint_encoder(self, x_slice, feat_map, conv_idx):
+        """Helper for gradient checkpointing encoder"""
+        def custom_forward(x_inner):
+            return self.encoder(x_inner, feat_cache=feat_map, feat_idx=conv_idx)
+        return torch.utils.checkpoint.checkpoint(custom_forward, x_slice, use_reentrant=False)
+    
+    def _checkpoint_decoder(self, x_slice, feat_map, conv_idx, first_chunk=False):
+        """Helper for gradient checkpointing decoder"""
+        def custom_forward(x_inner):
+            return self.decoder(x_inner, feat_cache=feat_map, feat_idx=conv_idx, first_chunk=first_chunk)
+        return torch.utils.checkpoint.checkpoint(custom_forward, x_slice, use_reentrant=False)
+
     def encode(self, x):
         conv_idx = [0]
         feat_map = [None] * count_conv3d(self.encoder)
@@ -739,17 +753,31 @@ class WanVAE(nn.Module):
         for i in range(iter_):
             conv_idx = [0]
             if i == 0:
-                out = self.encoder(
-                    x[:, :, :1, :, :],
-                    feat_cache=feat_map,
-                    feat_idx=conv_idx,
-                )
+                if self.gradient_checkpointing and self.training:
+                    out = self._checkpoint_encoder(
+                        x[:, :, :1, :, :],
+                        feat_map,
+                        conv_idx,
+                    )
+                else:
+                    out = self.encoder(
+                        x[:, :, :1, :, :],
+                        feat_cache=feat_map,
+                        feat_idx=conv_idx,
+                    )
             else:
-                out_ = self.encoder(
-                    x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=feat_map,
-                    feat_idx=conv_idx,
-                )
+                if self.gradient_checkpointing and self.training:
+                    out_ = self._checkpoint_encoder(
+                        x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                        feat_map,
+                        conv_idx,
+                    )
+                else:
+                    out_ = self.encoder(
+                        x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                        feat_cache=feat_map,
+                        feat_idx=conv_idx,
+                    )
                 out = torch.cat([out, out_], 2)
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         return mu
@@ -762,21 +790,44 @@ class WanVAE(nn.Module):
         for i in range(iter_):
             conv_idx = [0]
             if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=feat_map,
-                    feat_idx=conv_idx,
-                    first_chunk=True,
-                )
+                if self.gradient_checkpointing and self.training:
+                    out = self._checkpoint_decoder(
+                        x[:, :, i:i + 1, :, :],
+                        feat_map,
+                        conv_idx,
+                        first_chunk=True,
+                    )
+                else:
+                    out = self.decoder(
+                        x[:, :, i:i + 1, :, :],
+                        feat_cache=feat_map,
+                        feat_idx=conv_idx,
+                        first_chunk=True,
+                    )
             else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=feat_map,
-                    feat_idx=conv_idx,
-                )
+                if self.gradient_checkpointing and self.training:
+                    out_ = self._checkpoint_decoder(
+                        x[:, :, i:i + 1, :, :],
+                        feat_map,
+                        conv_idx,
+                    )
+                else:
+                    out_ = self.decoder(
+                        x[:, :, i:i + 1, :, :],
+                        feat_cache=feat_map,
+                        feat_idx=conv_idx,
+                    )
                 out = torch.cat([out, out_], 2)
         out = unpatchify(out, patch_size=2)
         return out
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory-efficient training"""
+        self.gradient_checkpointing = True
+    
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing"""
+        self.gradient_checkpointing = False
 
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)

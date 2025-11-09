@@ -243,9 +243,13 @@ class WanModel(torch.nn.Module):
         device=None,
         dtype=None,
         operations=ops,
+        gradient_checkpointing=False,
+        offload_to_cpu=False,
     ):
         super().__init__()
         self.dtype = dtype
+        self.gradient_checkpointing = gradient_checkpointing
+        self.offload_to_cpu = offload_to_cpu
         
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
@@ -336,6 +340,13 @@ class WanModel(torch.nn.Module):
         freqs = self.rope_embedder(img_ids).movedim(1, 2)
         return freqs
 
+    def _checkpoint_block(self, block, x, e0, freqs, context, transformer_options):
+        """Helper function for gradient checkpointing"""
+        def custom_forward(x_inner):
+            return block(x_inner, e=e0, freqs=freqs, context=context,
+                        transformer_options=transformer_options)
+        return torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=False)
+
     def forward_orig(self, x, t, context, clip_fea=None, freqs=None, transformer_options={}, **kwargs):
         """
         Forward pass through the diffusion model
@@ -365,12 +376,25 @@ class WanModel(torch.nn.Module):
         context = self.text_embedding(context)
         
 
-        # Apply transformer blocks
+        # Apply transformer blocks with optional gradient checkpointing and offloading
         for i, block in enumerate(self.blocks):
-            x = block(
-                x, e=e0, freqs=freqs, context=context,
-                transformer_options=transformer_options
-            )
+            # Move current block to device if offloading is enabled
+            if self.offload_to_cpu:
+                block.to(x.device)
+            
+            # Apply block with optional gradient checkpointing
+            if self.gradient_checkpointing and self.training:
+                x = self._checkpoint_block(block, x, e0, freqs, context, transformer_options)
+            else:
+                x = block(
+                    x, e=e0, freqs=freqs, context=context,
+                    transformer_options=transformer_options
+                )
+            
+            # Offload current block to CPU after processing if enabled
+            if self.offload_to_cpu:
+                block.cpu()
+                torch.cuda.empty_cache()
 
         # Output head
         x = self.head(x, e)
@@ -427,3 +451,19 @@ class WanModel(torch.nn.Module):
         u = torch.einsum('bfhwpqrc->bcfphqwr', u)
         u = u.reshape(b, c, *[i * j for i, j in zip(grid_sizes, self.patch_size)])
         return u
+    
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory-efficient training"""
+        self.gradient_checkpointing = True
+    
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing"""
+        self.gradient_checkpointing = False
+    
+    def enable_offloading(self):
+        """Enable block offloading to CPU for memory-efficient inference"""
+        self.offload_to_cpu = True
+    
+    def disable_offloading(self):
+        """Disable block offloading"""
+        self.offload_to_cpu = False

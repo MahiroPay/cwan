@@ -5,6 +5,11 @@ uses in ComfyUI.  It expects precomputed text embeddings (conditioned and
 unconditioned) saved as Safetensors as produced by ``precalculate_text_embeds``.
 Optionally, the script can decode the final latent with the Wan VAE and save a
 PNG preview of the first frame.
+
+Memory Optimizations:
+- Use --offload-to-cpu to enable block offloading for memory-efficient inference
+- Reduces GPU memory requirements but slows inference by ~2-3x
+- See MEMORY_OPTIMIZATIONS.md for detailed documentation
 """
 
 from __future__ import annotations
@@ -44,9 +49,14 @@ def build_model(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         num_layers=args.num_layers,
         text_len=512,
         text_dim=4096,
+        offload_to_cpu=args.offload_to_cpu,
     )
     state_dict = safe_torch.load_file(str(args.checkpoint), device="cpu")
     model.load_state_dict(state_dict)
+    
+    if args.offload_to_cpu:
+        print("Block offloading to CPU enabled for memory-efficient inference")
+    
     return model.to(device=device, dtype=dtype).eval()
 
 
@@ -166,6 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--offload-to-cpu", action="store_true", help="Enable block offloading to CPU for memory-efficient inference")
     return parser.parse_args()
 
 
