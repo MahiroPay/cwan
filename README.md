@@ -31,20 +31,12 @@ python test_inference.py --checkpoint models/wan2.2.safetensors --cond cond.safe
 
 For detailed documentation, see [MEMORY_OPTIMIZATIONS.md](MEMORY_OPTIMIZATIONS.md)
 
-## Multi-GPU Training
+## train steps
 
-The training script now supports multi-GPU training on a single node using PyTorch's DistributedDataParallel.
-
-### Quick Start
-
-**Single GPU:**
-```bash
-python train_flow_matching.py --batch_size 1 --num_epochs 100
+precalc latents, text, train
 ```
 
-**Multi-GPU (2 GPUs):**
-```bash
-./train_multigpu.sh 2 --batch_size 2 --num_epochs 50
+python precalculate_text_embeds.py  --checkpoint models/umt5_xxl_fp16.safetensors --tokenizer-path models/spiece.model --dataset-dir shiina
+python precalculate_image_embeds.py  --vae-checkpoint models/wan2.2_vae.safetensors --dataset-dir shiina
+python train_flow_matching.py --batch_size 1 --num_epochs 15 --gradient_checkpointing --dataset-dir shiina
 ```
-
-For detailed instructions and examples, see [MULTI_GPU_TRAINING.md](MULTI_GPU_TRAINING.md)

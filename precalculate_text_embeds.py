@@ -82,7 +82,6 @@ def main() -> None:
             embeddings = [clip.encode_from_tokens_scheduled(tok) for tok in toks]
         for idx, target in enumerate(targets):
             target.parent.mkdir(parents=True, exist_ok=True)
-            print(embeddings)
             save_file(
                 {
                     "embeddings": embeddings[idx][0][0].cpu().contiguous(),

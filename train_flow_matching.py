@@ -422,7 +422,7 @@ class FlowMatchingTrainer:
             'global_step': self.global_step,
             'epoch': self.epoch,
         }
-        safe_torch.save_file(checkpoint, path)
+        safe_torch.save_file(checkpoint['model_state_dict'], path)
         # torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
     
@@ -572,7 +572,7 @@ def main():
     )
     print('dataloader and scheduler set up')
     # Training loop
-    num_epochs = 5
+    num_epochs = args.num_epochs
     for epoch in range(num_epochs):
         metrics = trainer.train_epoch(dataloader, scheduler)
         print(
@@ -581,11 +581,10 @@ def main():
         )
         
         # Save checkpoint every N epochs
-        if (epoch + 1) % 10 == 0:
-            trainer.save_checkpoint(f"checkpoints/wan22_flow_epoch_{epoch+1}.pt")
+        trainer.save_checkpoint(f"checkpoints/wan22_flow_epoch_{epoch+1}.safetensors")
     
     # Save final model
-    trainer.save_checkpoint("checkpoints/wan22_flow_final.pt")
+    trainer.save_checkpoint("checkpoints/wan22_flow_final.safetensors")
     logger.info("Training complete!")
 
 
