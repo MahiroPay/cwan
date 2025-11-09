@@ -51,7 +51,7 @@ def precalculate_latents(
     overwrite: bool = False,
     decode_test: bool = False,
 ):
-    image_paths = [p for p in dataset_path.rglob('*') if p.suffix.lower() in EXTENSIONS]
+    image_paths = [p for p in dataset_path.rglob('*') if p.suffix.lower() in EXTENSIONS  and ".ipynb_checkpoints" not in str(p)]
     if not image_paths:
         logger.warning("No images or videos found for latent precalculation")
         return
