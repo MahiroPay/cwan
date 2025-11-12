@@ -199,11 +199,6 @@ class FlowMatchingTrainer:
         loss = F.mse_loss(predicted_velocity, ground_truth_velocity)
         
         with torch.no_grad():
-            cos_sim = F.cosine_similarity(
-                predicted_velocity.view(predicted_velocity.shape[0], -1),
-                ground_truth_velocity.view(ground_truth_velocity.shape[0], -1),
-                dim=-1
-            ).mean()
             pred_residual_mag = predicted_velocity.pow(2).mean().sqrt()
             target_residual_mag = ground_truth_velocity.pow(2).mean().sqrt()
             sigma_mean = sigma.mean()
@@ -212,7 +207,7 @@ class FlowMatchingTrainer:
             'loss': loss,
             'pred_residual_mag': pred_residual_mag,
             'target_residual_mag': target_residual_mag,
-            'residual_cos_sim': cos_sim,
+            'residual_cos_sim': 0,
             'sigma_mean': sigma_mean,
         }
     
