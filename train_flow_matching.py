@@ -176,7 +176,7 @@ class FlowMatchingTrainer:
         x_t: Optional[torch.Tensor] = None,
         x_0: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        sigma = sigma.to(self.device, dtype=torch.float32)
+        sigma = sigma.to(self.device, dtype=torch.bfloat16)
 
         if x_t is None or x_0 is None:
             x_t, x_0 = self.get_noisy_latent(x_1, sigma)
