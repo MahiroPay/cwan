@@ -269,7 +269,7 @@ class FlowMatchingTrainer:
             'grad_norm': grad_norm.item(),
             'pred_residual_mag': loss_dict['pred_residual_mag'].item(),
             'target_residual_mag': loss_dict['target_residual_mag'].item(),
-            'residual_cos_sim': loss_dict['residual_cos_sim'].item(),
+            'residual_cos_sim': loss_dict['residual_cos_sim'],
             'sigma_mean': loss_dict['sigma_mean'].item(),
             'learning_rate': self.optimizer.param_groups[0]['lr'],
         }
