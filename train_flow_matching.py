@@ -188,13 +188,13 @@ class FlowMatchingTrainer:
                     x_t, 
                     sigma, 
                     context
-                ).to(torch.float32)
+                )
         else:
             predicted_velocity = self.model(
                 x_t.to(self.dtype), 
                 sigma, 
                 context.to(self.dtype)
-            ).to(torch.float32)
+            )
         
         loss = F.mse_loss(predicted_velocity, ground_truth_velocity)
         
