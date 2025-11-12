@@ -72,7 +72,7 @@ class FlowMatchingTrainer:
         
         # Sigmas
         timestep = (torch.arange(1, self.num_timesteps + 1, 1) / self.num_timesteps) * self.sigma_multiplier
-        self.sigmas = time_snr_shift(self.sigma_shift, timestep / self.sigma_multiplier)
+        self.sigmas = time_snr_shift(self.sigma_shift, timestep / self.sigma_multiplier).to("cpu")
         
         # Model components
         self.model = model.to(device)
@@ -146,7 +146,7 @@ class FlowMatchingTrainer:
             low=0, 
             high=self.num_timesteps, 
             size=(batch_size,),
-            device=self.device
+            device="cpu"
         )
         sigmas = self.sigmas[indices].to(self.device, dtype=torch.float32)
         return sigmas
