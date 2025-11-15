@@ -25,7 +25,7 @@ import importlib
 import platform
 import weakref
 import gc
-
+METAMODE = True
 memargs = {
     'fp32_unet':False,
     'fp64_unet':False,
@@ -164,6 +164,8 @@ def is_ixuca():
     return False
 directml_enabled = False
 def get_torch_device():
+    if METAMODE:
+        return torch.device("meta")
     global directml_enabled
     global cpu_state
     if directml_enabled:
@@ -215,8 +217,8 @@ def get_total_memory(dev=None, torch_total_too=False):
             mem_total = mem_total_mlu
         else:
             stats = torch.cuda.memory_stats(dev)
-            mem_reserved = stats['reserved_bytes.all.current']
-            _, mem_total_cuda = torch.cuda.mem_get_info(dev)
+            mem_reserved = 0
+            _, mem_total_cuda = None, 0
             mem_total_torch = mem_reserved
             mem_total = mem_total_cuda
 
@@ -692,12 +694,16 @@ def dtype_size(dtype):
     return dtype_size
 
 def unet_offload_device():
+    if METAMODE:
+        return torch.device("meta")
     if vram_state == VRAMState.HIGH_VRAM:
         return get_torch_device()
     else:
         return torch.device("cpu")
 
 def unet_inital_load_device(parameters, dtype):
+    if METAMODE:
+        return torch.device("meta")
     torch_dev = get_torch_device()
     if vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.SHARED:
         return torch_dev
@@ -796,9 +802,13 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
     return torch.float32
 
 def text_encoder_offload_device():
+    if METAMODE:
+        return torch.device("meta")
     return torch.device("cpu")
 
 def text_encoder_device():
+    if METAMODE:
+        return torch.device("meta")
     if vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.NORMAL_VRAM:
         if should_use_fp16(prioritize_performance=False):
             return get_torch_device()
@@ -808,6 +818,8 @@ def text_encoder_device():
         return torch.device("cpu")
 
 def text_encoder_initial_device(load_device, offload_device, model_size=0):
+    if METAMODE:
+        return torch.device("meta")
     if load_device == offload_device or model_size <= 1024 * 1024 * 1024:
         return offload_device
 
@@ -840,17 +852,23 @@ def text_encoder_dtype(device=None):
 
 
 def intermediate_device():
+    if METAMODE:
+        return torch.device("meta")
     if memargs.get("gpu_only", False):
         return get_torch_device()
     else:
         return torch.device("cpu")
 
 def vae_device():
+    if METAMODE:
+        return torch.device("meta")
     if memargs.get("cpu_vae", False):
         return torch.device("cpu")
     return get_torch_device()
 
 def vae_offload_device():
+    if METAMODE:
+        return torch.device("meta")
     if memargs.get("gpu_only", False):
         return get_torch_device()
     else:
@@ -874,6 +892,8 @@ def vae_dtype(device=None, allowed_dtypes=[]):
     return torch.float32
 
 def get_autocast_device(dev):
+    if METAMODE:
+        return torch.device("meta")
     if hasattr(dev, 'type'):
         return dev.type
     return "cuda"
